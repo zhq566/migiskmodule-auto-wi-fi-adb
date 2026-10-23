@@ -1,0 +1,6 @@
+id=cloud_phone_auto
+name=自动scrcpy的adb服务
+version=1.0
+versionCode=1
+author=Local
+description=连上Wi-Fi或开热点自动开启无线ADB(5555)；scrcpy连入时关背光并切换分辨率，断开后恢复
