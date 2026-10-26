@@ -6,7 +6,7 @@ MODDIR=${0%/*}
 # ===== 可修改参数 =====
 ADB_PORT=5555
 # 投屏时使用的分辨率和 DPI（按投屏端屏幕修改）
-TARGET_SIZE=1080x2400
+TARGET_SIZE=1080x2460
 TARGET_DENSITY=400
 # 投屏时把背光写成的值。0=全黑，部分 OLED 机型写 0 会让面板/触控进入 deep sleep，
 # 断开后写回原值也点不亮（只能重启）。稳妥起见默认 1（最暗），确认安全再改 0。
@@ -130,12 +130,23 @@ done
 sleep 5
 
 # 2. 查找物理背光节点
-BACKLIGHT_DIR=$(ls -d /sys/class/backlight/* 2>/dev/null | head -n 1)
-BACKLIGHT_NODE="$BACKLIGHT_DIR/brightness"
-MAX_BRIGHT=$(cat "$BACKLIGHT_DIR/max_brightness" 2>/dev/null)
-[ -z "$MAX_BRIGHT" ] && MAX_BRIGHT=255
-[ -f "$BACKLIGHT_NODE" ] || BACKLIGHT_NODE=""
-log "backlight=$BACKLIGHT_NODE max=$MAX_BRIGHT"
+  BACKLIGHT_NODE=""
+  BACKLIGHT_DIR=""
+  
+  # 遍历常见的背光节点可能所在的目录
+  for dir in /sys/class/backlight/* /sys/class/leds/lcd-backlight; do
+    if [ -f "$dir/brightness" ]; then
+      BACKLIGHT_DIR="$dir"
+      BACKLIGHT_NODE="$dir/brightness"
+      MAX_BRIGHT=$(cat "$dir/max_brightness" 2>/dev/null)
+      break # 找到了就立马跳出循环
+    fi
+  done
+
+  # 兜底最大亮度
+  [ -z "$MAX_BRIGHT" ] && MAX_BRIGHT=255
+  
+  log "backlight=$BACKLIGHT_NODE max=$MAX_BRIGHT"
 
 # 网卡的第一个 IPv4 地址（形如 192.168.43.1/24），没有则输出空。
 # 不用 ip 的 -o（单行）输出：不同实现（BusyBox / 系统 iproute2）的 -o 格式不一致，
@@ -248,7 +259,8 @@ hotspot_up() {
 }
 
 scrcpy_running() {
-  pgrep -f "com.genymobile.scrcpy.Server" > /dev/null 2>&1
+  # 使用 -e 参数同时匹配原版的包名和第三方版的包名
+  ps -ef 2>/dev/null | grep -e "com.genymobile.scrcpy.Server" -e "org.server.scrcpy.Server" | grep -v "grep" > /dev/null 2>&1
 }
 
 adb_tcp_on() {
@@ -680,43 +692,51 @@ while true; do
     adb_on=0
   fi
 
-  # 5. 监测 scrcpy 连入/断开
+# 5. 监测 scrcpy 连入/断开
   if scrcpy_running; then
     if [ "$is_connected" -eq 0 ]; then
       if [ -n "$BACKLIGHT_NODE" ]; then
         SAVED_BRIGHT=$(cat "$BACKLIGHT_NODE")
       fi
-      # 记下用户原来的 size/density（Override size 形如 "Override size: 1080x2400"）
+      # 记下用户原来的 size/density
       SAVED_SIZE=$(wm size 2>/dev/null | sed -n 's/.*Override size: *//p' | head -n 1)
       SAVED_DENSITY=$(wm density 2>/dev/null | sed -n 's/.*Override density: *//p' | head -n 1)
+      
       wm size "$TARGET_SIZE"
       wm density "$TARGET_DENSITY"
       is_connected=1
       log "scrcpy connected, saved brightness=$SAVED_BRIGHT size=${SAVED_SIZE:-default} density=${SAVED_DENSITY:-default}"
     fi
-    # 每轮都强制压低背光，防止系统/自动亮度把它改回来
-    if [ -n "$BACKLIGHT_NODE" ] && [ "$(cat "$BACKLIGHT_NODE" 2>/dev/null)" != "$BRIGHTNESS_OFF" ]; then
-      echo "$BRIGHTNESS_OFF" > "$BACKLIGHT_NODE" 2>/dev/null
+    
+    # 每轮都强制写入 0，防止系统/自动亮度把背光改回来
+    if [ -n "$BACKLIGHT_NODE" ] && [ "$(cat "$BACKLIGHT_NODE" 2>/dev/null)" != "0" ]; then
+      echo 0 > "$BACKLIGHT_NODE" 2>/dev/null
     fi
+
   elif [ "$is_connected" -eq 1 ]; then
-    # wm size/density reset 回的是出厂值；如果本来就自定义过，恢复成原值
+    # 恢复原状
     if [ -n "$SAVED_SIZE" ]; then
       wm size "$SAVED_SIZE"
     else
       wm size reset
     fi
+    
     if [ -n "$SAVED_DENSITY" ]; then
       wm density "$SAVED_DENSITY"
     else
       wm density reset
     fi
+    
     if [ -n "$BACKLIGHT_NODE" ]; then
       # 保底亮度：原值无效时用最大值的一半，避免黑屏无法操作
       if [ -z "$SAVED_BRIGHT" ] || [ "$SAVED_BRIGHT" -le 0 ] 2>/dev/null; then
         SAVED_BRIGHT=$((MAX_BRIGHT / 2))
+        # 兜底中的兜底
+        [ "$SAVED_BRIGHT" -eq 0 ] && SAVED_BRIGHT=128 
       fi
-      echo "$SAVED_BRIGHT" > "$BACKLIGHT_NODE"
+      echo "$SAVED_BRIGHT" > "$BACKLIGHT_NODE" 2>/dev/null
     fi
+    
     is_connected=0
     log "scrcpy disconnected, restored brightness=$SAVED_BRIGHT"
   fi
