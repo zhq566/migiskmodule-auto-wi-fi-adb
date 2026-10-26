@@ -1,0 +1,8 @@
+# TCP 监听端口 (给普通连接用)
+bindPort = 7000
+
+# 开启 QUIC 监听，并绑定到同一个 7000 的 UDP 端口
+quicBindPort = 7000
+
+[auth]
+token = "123456789"

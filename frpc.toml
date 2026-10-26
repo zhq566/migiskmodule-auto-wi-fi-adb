@@ -1,0 +1,17 @@
+serverAddr = "192.168.6.253"
+serverPort = 7000
+
+[auth]
+token = "123456789"
+
+# QUIC 传输协议独立区块
+[transport]
+protocol = "quic"
+
+# 代理配置必须放在最下面！
+[[proxies]]
+name = "scrcpy_adb"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 5555
+remotePort = 25555

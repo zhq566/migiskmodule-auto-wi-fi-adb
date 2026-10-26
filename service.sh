@@ -31,18 +31,19 @@ VPNPRI=auto
 # 启用失败后的重试间隔（秒），避免每轮刷日志
 VPN_RETRY=10
 # ============================ Frpc ============================
+FRPC_ENABLED=0
 # 定义绝对路径，绕过任何系统限制
 FRPC_BIN="/system/bin/frpc"
 REAL_FRPC_BIN="$MODDIR/system/bin/frpc"
-FRPC_CONF="$MODDIR/frpc.ini"
+FRPC_CONF="$MODDIR/frpc.toml"
 FRPC_LOG="$MODDIR/frpc.log"
 chmod 755 "$REAL_FRPC_BIN" 2>/dev/null
 chown root:root "$REAL_FRPC_BIN" 2>/dev/null
 # ===================== Frpc ============================
 
-LOG="$MODDIR/run.log"
+LOG_FILE="$MODDIR/run.log"
 # 保留上一轮日志（run.log.1），排查「上次为什么没生效」时有用
-[ -f "$LOG" ] && mv -f "$LOG" "$LOG.1"
+[ -f "$LOG_FILE" ] && mv -f "$LOG_FILE" "$LOG_FILE.1"
 log() {
   echo "$(date '+%m-%d %H:%M:%S') $1" >> "$LOG_FILE"
   
@@ -817,32 +818,31 @@ while true; do
   fi
 
   # --- NekoBox 与 frpc 联动逻辑 (原生适配版 + 精准 tun 检测) ---
-  # 直接调用你的 find_tun 函数。加 >/dev/null 是为了吃掉它 echo 出的网卡名字，保持日志干净
-  if find_tun >/dev/null; then
-
-    # 找到了真正在工作的 VPN 网卡，检查 frpc 起来没
-    if ! ps -ef 2>/dev/null | grep "$FRPC_BIN" | grep -v grep >/dev/null 2>&1; then
-      log "VPN (tun) 已完全连通，拉起 frpc 穿透..."
-      "$FRPC_BIN" -c "$FRPC_CONF" > "$FRPC_LOG" 2>&1 &
+  if [ "$FRP_ENABLE" -eq 1 ]; then
+    if find_tun >/dev/null; then
+  
+      # 找到了真正在工作的 VPN 网卡，检查 frpc 起来没
+      if ! ps -ef 2>/dev/null | grep "$FRPC_BIN" | grep -v grep >/dev/null 2>&1; then
+        log "VPN (tun) 已完全连通，拉起 frpc 穿透..."
+        "$FRPC_BIN" -c "$FRPC_CONF" > "$FRPC_LOG" 2>&1 &
+      fi
+      
+    else
+      # 没找到有效的 VPN 网卡，说明断开了，干掉 frpc
+      if ps -ef 2>/dev/null | grep "$FRPC_BIN" | grep -v grep >/dev/null 2>&1; then
+        log "VPN (tun) 已断开，杀掉 frpc 进程..."
+        kill -9 $(ps -ef 2>/dev/null | grep "$FRPC_BIN" | grep -v grep | awk '{print $2}') 2>/dev/null
+      fi
+      
     fi
-    
-  else
-    
-    # 没找到有效的 VPN 网卡，说明断开了，干掉 frpc
-    if ps -ef 2>/dev/null | grep "$FRPC_BIN" | grep -v grep >/dev/null 2>&1; then
-      log "VPN (tun) 已断开，杀掉 frpc 进程..."
-      kill -9 $(ps -ef 2>/dev/null | grep "$FRPC_BIN" | grep -v grep | awk '{print $2}') 2>/dev/null
+    # --------------限制 frpc 日志大小 100KB -------------
+    if [ -f "$FRPC_LOG" ]; then
+      frpc_size=$(wc -c < "$FRPC_LOG" 2>/dev/null || echo 0)
+      if [ "$frpc_size" -gt 102400 ]; then
+        tail -n 500 "$FRPC_LOG" > "$FRPC_LOG.tmp"
+        mv -f "$FRPC_LOG.tmp" "$FRPC_LOG"
+      fi
     fi
-    
   fi
-  # --------------限制 frpc 日志大小 100KB -------------
-  if [ -f "$FRPC_LOG" ]; then
-    frpc_size=$(wc -c < "$FRPC_LOG" 2>/dev/null || echo 0)
-    if [ "$frpc_size" -gt 102400 ]; then
-      tail -n 500 "$FRPC_LOG" > "$FRPC_LOG.tmp"
-      mv -f "$FRPC_LOG.tmp" "$FRPC_LOG"
-    fi
-  fi
-
   sleep 3
 done
