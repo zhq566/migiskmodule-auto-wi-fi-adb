@@ -8,6 +8,9 @@ ADB_PORT=5555
 # 投屏时使用的分辨率和 DPI（按投屏端屏幕修改）
 TARGET_SIZE=1080x2400
 TARGET_DENSITY=400
+# 投屏时把背光写成的值。0=全黑，部分 OLED 机型写 0 会让面板/触控进入 deep sleep，
+# 断开后写回原值也点不亮（只能重启）。稳妥起见默认 1（最暗），确认安全再改 0。
+BRIGHTNESS_OFF=1
 # Wi-Fi 网卡名匹配（wlan0/wlan1/swlan0 等；热点 ap0/softap0 单独检测）
 WIFI_IF_REGEX='^[0-9]+: (wlan|swlan|wifi)[0-9]+'
 # 热点网卡：留空=自动检测（先找 veth*，再 ap0/softap0，最后看无线网卡是否 AP 模式）
@@ -30,9 +33,72 @@ VPN_RETRY=10
 # =====================
 
 LOG="$MODDIR/run.log"
+# 保留上一轮日志（run.log.1），排查「上次为什么没生效」时有用
+[ -f "$LOG" ] && mv -f "$LOG" "$LOG.1"
 log() { echo "$(date '+%m-%d %H:%M:%S') $1" >> "$LOG"; }
-: > "$LOG"
 now() { date +%s; }
+
+# ===== 选一个支持自定义路由表的 ip =====
+# Magisk 会在 PATH 前面放自带 BusyBox，其中的 ip applet 不支持 table N：
+#   ip route add ... table 20000  ->  ip: invalid argument '20000' to 'table'
+# 策略路由是这套方案的基础，必须换成系统自带的 ip（/system/bin/ip）。
+# 不靠猜，直接往表里加一条再删掉，能成功才算可用。
+IPBIN=""
+pick_ip() {
+  local cand
+  for cand in /system/bin/ip /system/xbin/ip /vendor/bin/ip /sbin/ip; do
+    [ -x "$cand" ] || continue
+    "$cand" route add 192.0.2.0/24 dev lo table "$VPNTB" 2>/dev/null || continue
+    "$cand" route del 192.0.2.0/24 dev lo table "$VPNTB" 2>/dev/null
+    IPBIN="$cand"
+    return 0
+  done
+  # 最后才试 PATH 里的 ip（个别 ROM 的 BusyBox 是带 table 支持的定制版）
+  if command -v ip > /dev/null 2>&1 \
+      && ip route add 192.0.2.0/24 dev lo table "$VPNTB" 2>/dev/null; then
+    ip route del 192.0.2.0/24 dev lo table "$VPNTB" 2>/dev/null
+    IPBIN=$(command -v ip)
+    return 0
+  fi
+  return 1
+}
+if pick_ip; then
+  ip() { "$IPBIN" "$@"; }
+  log "ip=$IPBIN ok (table $VPNTB supported)"
+else
+  log "no ip with table support, vpn hotspot disabled"
+fi
+
+# 热点/VPN 切换时 netd 会密集操作 iptables，抢不到 xtables 锁就直接失败；
+# 更糟的是 -C 抢不到锁返回非 0 会被当成「规则不存在」，导致每 20 秒无谓重建。
+IPT_WAIT="-w 2"
+
+# iptables 同理：优先用系统自带的真 xtables，避免命中 BusyBox 的精简 applet
+IPTBIN=""
+pick_ipt() {
+  local cand
+  for cand in /system/bin/iptables /system/xbin/iptables /sbin/iptables; do
+    [ -x "$cand" ] || continue
+    "$cand" $IPT_WAIT -S FORWARD > /dev/null 2>&1 || continue
+    IPTBIN="$cand"
+    return 0
+  done
+  if command -v iptables > /dev/null 2>&1; then
+    IPTBIN=$(command -v iptables)
+    return 0
+  fi
+  return 1
+}
+pick_ipt || log "no usable iptables"
+
+IPT6BIN=""
+for cand in /system/bin/ip6tables /system/xbin/ip6tables /sbin/ip6tables; do
+  [ -x "$cand" ] && { IPT6BIN="$cand"; break; }
+done
+[ -n "$IPT6BIN" ] || IPT6BIN=$(command -v ip6tables 2>/dev/null)
+
+ipt() { "$IPTBIN" $IPT_WAIT "$@"; }
+ip6t() { "$IPT6BIN" $IPT_WAIT "$@"; }
 
 # 1. 等待系统完全引导启动
 until [ "$(getprop sys.boot_completed)" = "1" ]; do
@@ -48,34 +114,93 @@ MAX_BRIGHT=$(cat "$BACKLIGHT_DIR/max_brightness" 2>/dev/null)
 [ -f "$BACKLIGHT_NODE" ] || BACKLIGHT_NODE=""
 log "backlight=$BACKLIGHT_NODE max=$MAX_BRIGHT"
 
-# 网卡的第一个 IPv4 地址（形如 192.168.43.1/24），没有则输出空
+# 网卡的第一个 IPv4 地址（形如 192.168.43.1/24），没有则输出空。
+# 不用 ip 的 -o（单行）输出：不同实现（BusyBox / 系统 iproute2）的 -o 格式不一致，
+# 统一按普通多行输出解析，"inet X" 这一行在所有实现里都一样。
 ifaddr_of() {
-  ip -4 -o addr show dev "$1" 2>/dev/null \
-    | awk '{ for (i = 1; i < NF; i++) if ($i == "inet") { print $(i + 1); exit } }'
+  ip -4 addr show dev "$1" 2>/dev/null \
+    | awk '$1 == "inet" { print $2; exit }'
 }
 
-# 3. 查找热点网卡：优先 vlan 子接口（热点在 wlan 上开了 VLAN 时，
-#    该 veth 上挂着热点地址 192.168.43.x/24）；回退到 ap0 / softap0。
+# tun 的点对点对端地址（"inet 10.8.0.2 peer 10.8.0.1/32" 里的 10.8.0.1），没有则输出空
+peer_of() {
+  ip -4 addr show dev "$1" 2>/dev/null \
+    | awk '$1 == "inet" { for (i = 2; i < NF; i++) if ($i == "peer") { p = $(i + 1); sub(/\/.*/, "", p); print p; exit } }'
+}
+
+# 3. 查找热点网卡
+#    顺序：手动指定 > netd 的 tether 规则（最权威）> vlan 子接口 > ap0/softap0 > 无线网卡兜底
 HOTIF=""
+
+# 当前默认路由的上行网卡（有 VPN 时可能已经是 tun，只用来排除误判）
+uplink_if() {
+  ip route show default 2>/dev/null \
+    | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }'
+}
+
+# netd 开热点时会在 tetherctrl_FORWARD 里写
+#   "-A tetherctrl_FORWARD -i <热点网卡> -o <上行> -j RETURN"
+# 用它反查热点网卡比猜名字可靠，而且不依赖 iw（Android 原生镜像根本不带 iw）。
+# 只取 -i 侧：-o 侧是上行网卡（rmnet/tun），把它当热点会直接写坏规则。
+hotif_from_tether() {
+  local cand
+  for cand in $(ipt -S tetherctrl_FORWARD 2>/dev/null \
+      | awk '{
+          i = ""; o = ""; start = ""
+          for (n = 1; n < NF; n++) {
+            if ($n == "-i") i = $(n + 1)
+            if ($n == "-o") o = $(n + 1)
+          }
+          # 只看 FORWARD 转发规则，跳过 netd 的 dns 例外之类的特殊行
+          if (i != "" && i != "lo" && i != o) print i
+        }' | sort -u); do
+    [ -n "$(ifaddr_of "$cand")" ] && { echo "$cand"; return 0; }
+  done
+  return 1
+}
+
 scan_hotspot() {
+  local cand veth ifc addr uplink
   HOTIF=""
   if [ -n "$HOTSPOT_IF" ]; then
     [ -n "$(ifaddr_of "$HOTSPOT_IF")" ] && HOTIF="$HOTSPOT_IF"
     return
   fi
-  for veth in $(ls /sys/class/net 2>/dev/null | grep -E '^veth[0-9]+$'); do
-    [ -n "$(ifaddr_of "$veth")" ] && { HOTIF="$veth"; break; }
-  done
+
+  # 1) netd 认为正在 tether 的网卡
+  cand=$(hotif_from_tether)
+  [ -n "$cand" ] && HOTIF="$cand"
+
+  # 2) vlan 子接口（热点在 wlan 上开了 VLAN 时，该 veth 上挂着热点地址 192.168.43.x/24）
+  if [ -z "$HOTIF" ]; then
+    for veth in $(ls /sys/class/net 2>/dev/null | grep -E '^veth[0-9]+$'); do
+      [ -n "$(ifaddr_of "$veth")" ] && { HOTIF="$veth"; break; }
+    done
+  fi
+
+  # 3) 固定名字的软 AP 网卡
   if [ -z "$HOTIF" ]; then
     for cand in ap0 softap0 wlan1 swlan0 ap_br_wlan0 br0; do
       [ -n "$(ifaddr_of "$cand")" ] && { HOTIF="$cand"; break; }
     done
   fi
-  # 部分机型直接用 wlan0/swlan0 当热点：看无线网卡是不是 AP 模式
-  if [ -z "$HOTIF" ] && command -v iw > /dev/null 2>&1; then
-    for ifc in $(ls /sys/class/net 2>/dev/null | grep -E '^(wlan|swlan|wifi|wl)'); do
-      [ -n "$(ifaddr_of "$ifc")" ] || continue
-      iw dev "$ifc" info 2>/dev/null | grep -q 'type AP' && { HOTIF="$ifc"; break; }
+
+  # 4) 热点直接跑在 wlan0 上的机型
+  if [ -z "$HOTIF" ]; then
+    uplink=$(uplink_if)
+    for ifc in $(ls /sys/class/net 2>/dev/null | grep -E '^(wlan|swlan|wifi|wl)[0-9]+$'); do
+      addr=$(ifaddr_of "$ifc")
+      [ -n "$addr" ] || continue
+      if command -v iw > /dev/null 2>&1; then
+        iw dev "$ifc" info 2>/dev/null | grep -q 'type AP' && { HOTIF="$ifc"; break; }
+      else
+        # 没有 iw 时的兜底：热点网关地址主机位必为 .1，且它不会是默认路由的上行网卡。
+        # （DHCP 客户端拿到 .1 基本不可能，所以误判风险很小）
+        [ "$ifc" = "$uplink" ] && continue
+        case "$addr" in
+          192.168.43.1/*|192.168.49.1/*|192.168.*.1/*|10.*.*.1/*) HOTIF="$ifc"; break ;;
+        esac
+      fi
     done
   fi
 }
@@ -83,8 +208,13 @@ scan_hotspot
 log "hotspot if=${HOTIF:-未找到}"
 
 # Wi-Fi 已连接（对应网卡上有 IPv4 地址）
+# 不用 ip -o：不同实现的单行格式不一致，按普通输出逐行匹配更稳
 wifi_up() {
-  ip -4 -o addr show 2>/dev/null | grep -qE "$WIFI_IF_REGEX"
+  ip -4 addr show 2>/dev/null \
+    | awk -v re="$WIFI_IF_REGEX" '
+        /^[0-9]+: /{ ifc = $2; sub(/:$/, "", ifc); next }
+        $1 == "inet" && ifc ~ re { found = 1; exit }
+        END { exit !found }'
 }
 
 # 热点已开启：热点网卡上确实有 IPv4 地址才算
@@ -130,21 +260,36 @@ subnet_of() {
     *) return 1 ;;
   esac
   echo "$1" | awk '
+    # 不用 2^n：部分精简 awk（toybox）对幂运算符支持不一致，直接查 8 位掩码表
+    BEGIN { split("0 128 192 224 240 248 252 254 255", mask8, " ") }
     function and8(a, b,   r, s) {
       r = 0; s = 1
       while (a > 0 && b > 0) { if (a % 2 == 1 && b % 2 == 1) r += s; a = int(a / 2); b = int(b / 2); s *= 2 }
       return r
     }
+    # 第 k 个字节（k=1..4）在前缀 m 下还剩几位
+    function octmask(m, k,   rem) {
+      rem = m - (k - 1) * 8
+      if (rem <= 0) return 0
+      if (rem >= 8) return 255
+      return mask8[rem + 1]
+    }
     {
-      split($1, i, "/"); m = i[2] + 0; if (m < 8 || m > 32) exit 1
+      split($1, i, "/"); m = i[2] + 0
+      # /31、/32 是点对点或单主机，热点不会是这种，算出来的规则也永远不命中
+      if (m < 16 || m > 30) exit 1
       split(i[1], o, ".")
-      split("", mk)
-      for (n = 1; n <= m; n++) mk[int((n - 1) / 8) + 1] += 2 ^ (7 - (n - 1) % 8)
-      printf "%d.%d.%d.%d/%d", and8(o[1], mk[1]), and8(o[2], mk[2]), and8(o[3], mk[3]), and8(o[4], mk[4]), m
+      for (n = 1; n <= 4; n++) if (o[n] !~ /^[0-9]+$/ || o[n] + 0 > 255) exit 1
+      printf "%d.%d.%d.%d/%d", \
+        and8(o[1] + 0, octmask(m, 1)), and8(o[2] + 0, octmask(m, 2)), \
+        and8(o[3] + 0, octmask(m, 3)), and8(o[4] + 0, octmask(m, 4)), m
     }'
 }
 
-# 候选 ip rule 优先级，按顺序尝试，第一个没被占用的会被采用。
+# 候选 ip rule 优先级。
+# Linux 的 ip rule 允许同一个 pref 有多条规则（按插入顺序排列），所以 ip rule add
+# 只有在「选择器和表完全相同」时才会报 EEXIST。正常情况下第一条 1000 就会成功，
+# 后面几个只是兜底（比如上次残留了一条一模一样的）。
 # 必须尽量小：系统会为热点网卡和 fwmark 插入 1xxxx 的规则（iif ap0 / fwmark … lookup …），
 # 它们会把热点流量直接送去默认网络；我们的规则排在后面就永远轮不到 VPN。
 # 唯一必须排在它后面的是优先级 0 的 "lookup local"（本机地址判定），所以从 1000 起试。
@@ -162,12 +307,39 @@ rule_priority_candidates() {
   echo 25000
 }
 
+# 不同 ROM 的 ip 实现里，优先级关键字有的只认 pref，有的只认 priority，两种都试
+iprule_add_from() {
+  ip rule add from "$1" table "$2" pref "$3" 2>/dev/null && return 0
+  ip rule del from "$1" table "$2" pref "$3" 2>/dev/null
+  ip rule add from "$1" table "$2" priority "$3" 2>/dev/null && return 0
+  return 1
+}
+
+iprule_del_pref() {
+  ip rule del pref "$1" 2>/dev/null && return 0
+  ip rule del priority "$1" 2>/dev/null && return 0
+  return 1
+}
+
 # 扫掉所有指向本脚本策略表的 ip rule（不管优先级、选择器、来自哪个热点网段）。
 # 上次运行、旧版本、热点换网卡都可能留下规则，不清干净会串到下一次。
+# 只删选择器是具体网段的（"from all ..." 是系统规则，即使表号撞上也不能碰）。
+# 删除时先用 pref 定位，不认 pref 关键字的 ROM 回退到用整条选择器删除。
 flush_vpn_rules() {
   ip rule show 2>/dev/null \
-    | awk -v t="$VPNTB" '$0 ~ ("lookup " t "$") { p = $1; sub(/:$/, "", p); print p }' \
-    | while read -r p; do ip rule del priority "$p" 2>/dev/null; done
+    | awk -v t="$VPNTB" '
+        $0 !~ /from all/ && $0 ~ ("lookup " t "( |$)") {
+          p = $1; sub(/:$/, "", p)
+          sub(/^[^ \t]+[ \t]+/, "")   # 去掉 "1000:" 前缀，剩下选择器
+          print p "|" $0
+        }' \
+    | while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        p=${line%%|*}
+        sel=${line#*|}
+        iprule_del_pref "$p" && continue
+        [ -n "$sel" ] && ip rule del $sel 2>/dev/null
+      done
 }
 
 # VPN 热点共享开关（幂等，可反复调用）。
@@ -180,6 +352,7 @@ VPN_SUBNET=""
 VPN_ADDR=""
 VPN_PRI=""
 VPN_RPF=""
+VPN_RPF_ALL=""
 VPN_V6BLOCK=0
 
 # 删规则（enable 中途失败与 disable 共用）。参数：tun hotif subnet
@@ -196,41 +369,121 @@ remove_rules() {
   ip route flush table "$VPNTB" 2>/dev/null
   if [ -n "$tun" ]; then
     if [ -n "$subnet" ]; then
-      while iptables -t nat -D POSTROUTING -s "$subnet" -o "$tun" -j MASQUERADE 2>/dev/null; do :; done
+      while ipt -t nat -D POSTROUTING -s "$subnet" -o "$tun" -j MASQUERADE 2>/dev/null; do :; done
     fi
     if [ -n "$hotif" ]; then
-      while iptables -D FORWARD -i "$hotif" -o "$tun" -j ACCEPT 2>/dev/null; do :; done
-      while iptables -D FORWARD -i "$tun" -o "$hotif" \
+      # 新版本按源/目的网段放行
+      if [ -n "$subnet" ]; then
+        while ipt -D FORWARD -s "$subnet" -o "$tun" -j ACCEPT 2>/dev/null; do :; done
+        while ipt -D FORWARD -i "$tun" -d "$subnet" \
+          -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
+        while ipt -D FORWARD -i "$tun" -d "$subnet" -j ACCEPT 2>/dev/null; do :; done
+      fi
+      # 旧版本按入接口放行，一并清掉
+      while ipt -D FORWARD -i "$hotif" -o "$tun" -j ACCEPT 2>/dev/null; do :; done
+      while ipt -D FORWARD -i "$tun" -o "$hotif" \
         -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
       # enable 时 conntrack 不可用会退化成无状态放行，这条也要清
-      while iptables -D FORWARD -i "$tun" -o "$hotif" -j ACCEPT 2>/dev/null; do :; done
+      while ipt -D FORWARD -i "$tun" -o "$hotif" -j ACCEPT 2>/dev/null; do :; done
     fi
-    while iptables -t mangle -D FORWARD -o "$tun" -p tcp --tcp-flags SYN,RST SYN \
+    while ipt -t mangle -D FORWARD -o "$tun" -p tcp --tcp-flags SYN,RST SYN \
       -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; do :; done
+    # rp_filter 恢复到 enable 前的值（tun 与 all 两份都要还原，见 enable 里的说明）
     if [ -n "$VPN_RPF" ]; then
       echo "$VPN_RPF" > "/proc/sys/net/ipv4/conf/$tun/rp_filter" 2>/dev/null
     fi
+    if [ -n "$VPN_RPF_ALL" ]; then
+      echo "$VPN_RPF_ALL" > /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null
+    fi
   fi
   if [ "$VPN_V6BLOCK" = "1" ] && [ -n "$hotif" ]; then
-    while ip6tables -D FORWARD -i "$hotif" -j REJECT 2>/dev/null; do :; done
+    while ip6t -D FORWARD -i "$hotif" -j REJECT 2>/dev/null; do :; done
   fi
   VPN_V6BLOCK=0
   VPN_RPF=""
+  VPN_RPF_ALL=""
+}
+
+# 单次尝试：失败时把 ip 的报错记进 ROUTE_ERR，并清掉可能加了一半的路由。
+# 参数：目标网段 dst、完整参数串
+try_route() {
+  local dst="$1"
+  shift
+  ROUTE_ERR=$(ip route "$@" 2>&1) && return 0
+  ip route del "$dst" table "$VPNTB" 2>/dev/null
+  return 1
+}
+
+# 往策略表里加一条路由，返回 0 表示加成功了。
+# 不同 ROM 的 ip 实现（toybox / iproute2 / 精简版）支持度不一样，实测常见三种失败：
+# 1. toybox 老版本没有 "ip route replace"，直接 unknown command；
+# 2. 点对点 tun 要求写 "via <对端>"，只写 dev 报 Network is unreachable；
+# 3. 部分实现的参数解析很死板，要求 "table N" 写在目的地址前面。
+# 所以按组合依次尝试，每种写法前先删掉同名路由，避免 EEXIST 干扰。
+# 调用方最后还会读回表内容确认，不只信退出码。
+add_table_route() {
+  local dst="$1" dev="$2" via="$3"
+
+  if [ "$dst" = "default" ]; then
+    ip route del default table "$VPNTB" 2>/dev/null
+    try_route default add default dev "$dev" table "$VPNTB" && return 0
+    try_route default add table "$VPNTB" default dev "$dev" && return 0
+
+    if [ -n "$via" ]; then
+      try_route default add default via "$via" dev "$dev" table "$VPNTB" && return 0
+      try_route default add table "$VPNTB" default via "$via" dev "$dev" && return 0
+    fi
+
+    # onlink 跳过「网关不在直连网段」的检查
+    try_route default add default dev "$dev" onlink table "$VPNTB" && return 0
+    try_route default add table "$VPNTB" default dev "$dev" onlink && return 0
+
+    try_route default replace default dev "$dev" table "$VPNTB" && return 0
+    try_route default replace table "$VPNTB" default dev "$dev" && return 0
+  else
+    ip route del "$dst" table "$VPNTB" 2>/dev/null
+    try_route "$dst" add "$dst" dev "$dev" table "$VPNTB" && return 0
+    try_route "$dst" add table "$VPNTB" "$dst" dev "$dev" && return 0
+    try_route "$dst" add "$dst" dev "$dev" scope link table "$VPNTB" && return 0
+    try_route "$dst" replace "$dst" dev "$dev" table "$VPNTB" && return 0
+  fi
+  return 1
+}
+
+# 启用失败时把现场写进 run.log，方便贴出来定位（真机上能直接看到是哪一步不认）
+dump_vpn_state() {
+  log "---- vpn state dump ----"
+  log "ip=$(command -v ip) version=[$(ip -V 2>&1 | head -n 1)]"
+  log "hotif=$HOTIF addr=[$(ifaddr_of "$HOTIF")] tun=$1"
+  log "tun addr=[$(ifaddr_of "$1")] peer=[$(peer_of "$1")]"
+  log "rules=[$(ip rule show 2>/dev/null | tr '\n' ';')]"
+  log "table $VPNTB=[$(ip route show table "$VPNTB" 2>/dev/null | tr '\n' ';')]"
+  log "routes=[$(ip route show 2>/dev/null | tr '\n' ';')]"
+  log "rp_filter all=[$(cat /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null)]"
+  log "nets=[$(ls /sys/class/net 2>/dev/null | tr '\n' ' ')]"
+  log "------------------------"
 }
 
 enable_vpn_hotspot() {
-  local tun hotif addr subnet pri rpf cand
+  local tun hotif addr subnet pri rpf cand peer
 
+  # 没有支持自定义表的 ip 就别再重试了，日志里已经说明原因
+  [ -n "$IPBIN" ] || { log "no ip with table support, skip vpn hotspot"; return 1; }
+  [ -n "$IPTBIN" ] || { log "no usable iptables, skip vpn hotspot"; return 1; }
   hotspot_up || return 1
   hotif="$HOTIF"
   command -v iptables > /dev/null 2>&1 || { log "no iptables, skip vpn hotspot"; return 1; }
 
   addr=$(ifaddr_of "$hotif")
   subnet=$(subnet_of "$addr")
-  [ -n "$subnet" ] || return 1
+  if [ -z "$subnet" ]; then
+    log "vpn hotspot: bad hotspot addr [$addr] on $hotif, abort"
+    return 1
+  fi
 
   tun=$(find_tun) || return 1
   [ "$tun" != "$hotif" ] || return 1
+  peer=$(peer_of "$tun")
 
   VPN_RPF=""
   # 转发开关（开热点时系统本就为 1，这里兜底）
@@ -241,9 +494,20 @@ enable_vpn_hotspot() {
   #    移动数据与 Wi-Fi 切换都不受影响。
   #    先清空：热点网段换过（veth1 -> ap0）时，旧网段路由可能还指着已消失的网卡。
   ip route flush table "$VPNTB" 2>/dev/null
-  ip route replace "$subnet" dev "$hotif" table "$VPNTB" 2>/dev/null
-  if ! ip route replace default dev "$tun" table "$VPNTB" 2>/dev/null; then
-    log "vpn hotspot: route via $tun failed, abort"
+  ROUTE_ERR=""
+  if ! add_table_route "$subnet" "$hotif" ""; then
+    log "vpn hotspot: route $subnet dev $hotif failed: $ROUTE_ERR"
+  fi
+  if ! add_table_route default "$tun" "$peer"; then
+    log "vpn hotspot: default via $tun failed: $ROUTE_ERR"
+    dump_vpn_state "$tun"
+    remove_rules "$tun" "$hotif" "$subnet"
+    return 1
+  fi
+  # 读回确认（有的 ip 实现退出码是 0 但实际没写进表）
+  if ! ip route show table "$VPNTB" 2>/dev/null | grep -q '^default'; then
+    log "vpn hotspot: default route missing after add, abort (table=$VPNTB)"
+    dump_vpn_state "$tun"
     remove_rules "$tun" "$hotif" "$subnet"
     return 1
   fi
@@ -258,12 +522,12 @@ enable_vpn_hotspot() {
   # 仍然走热点网卡，不会被塞进 VPN。
   if [ "$VPNPRI" = "auto" ]; then
     for cand in $(rule_priority_candidates); do
-      if ip rule add from "$subnet" table "$VPNTB" priority "$cand" 2>/dev/null; then
+      if iprule_add_from "$subnet" "$VPNTB" "$cand"; then
         pri="$cand"
         break
       fi
     done
-  elif ip rule add from "$subnet" table "$VPNTB" priority "$VPNPRI" 2>/dev/null; then
+  elif iprule_add_from "$subnet" "$VPNTB" "$VPNPRI"; then
     pri="$VPNPRI"
   fi
   if [ -z "$pri" ]; then
@@ -274,8 +538,8 @@ enable_vpn_hotspot() {
 
   # 2. 源地址伪装成 tun 地址；不 NAT 的话 VPN 服务器收到 192.168.43.x 会直接丢包。
   #    插到链首，避免被系统/netd 的既有规则先截走。
-  if ! iptables -t nat -C POSTROUTING -s "$subnet" -o "$tun" -j MASQUERADE 2>/dev/null; then
-    if ! iptables -t nat -I POSTROUTING 1 -s "$subnet" -o "$tun" -j MASQUERADE 2>/dev/null; then
+  if ! ipt -t nat -C POSTROUTING -s "$subnet" -o "$tun" -j MASQUERADE 2>/dev/null; then
+    if ! ipt -t nat -I POSTROUTING 1 -s "$subnet" -o "$tun" -j MASQUERADE 2>/dev/null; then
       log "vpn hotspot: nat rule failed, abort"
       remove_rules "$tun" "$hotif" "$subnet"
       return 1
@@ -283,34 +547,48 @@ enable_vpn_hotspot() {
   fi
 
   # 3. 放行转发：系统的 FORWARD 只给「热点 -> 移动数据」开了口子，
-  #    走 tun 的这条路径没有规则，会被直接 DROP
-  iptables -C FORWARD -i "$hotif" -o "$tun" -j ACCEPT 2>/dev/null \
-    || iptables -I FORWARD 1 -i "$hotif" -o "$tun" -j ACCEPT 2>/dev/null
-  if ! iptables -C FORWARD -i "$tun" -o "$hotif" \
+  #    走 tun 的这条路径没有规则，会被 tetherctrl_FORWARD 链尾的 DROP 丢掉。
+  #    按源/目的网段匹配，不按 -i $hotif：热点地址可能挂在 veth0/ap0 上，
+  #    而客户端流量实际从另一个网卡进（每家 ROM 的热点实现都不一样），
+  #    按入接口匹配很容易一条都不命中，表现就是「规则全在但客户端不通」。
+  ipt -C FORWARD -s "$subnet" -o "$tun" -j ACCEPT 2>/dev/null \
+    || ipt -I FORWARD 1 -s "$subnet" -o "$tun" -j ACCEPT 2>/dev/null \
+    || log "vpn hotspot: forward out rule failed"
+  if ! ipt -C FORWARD -i "$tun" -d "$subnet" \
       -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; then
-    iptables -I FORWARD 1 -i "$tun" -o "$hotif" \
+    ipt -I FORWARD 1 -i "$tun" -d "$subnet" \
       -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
-      || iptables -I FORWARD 1 -i "$tun" -o "$hotif" -j ACCEPT 2>/dev/null
+      || ipt -I FORWARD 1 -i "$tun" -d "$subnet" -j ACCEPT 2>/dev/null \
+      || log "vpn hotspot: forward in rule failed"
   fi
 
   # 4. 隧道 MTU 比热点小，客户端发的大包会在 VPN 里被丢：钳制 TCP MSS
-  iptables -t mangle -C FORWARD -o "$tun" -p tcp --tcp-flags SYN,RST SYN \
+  ipt -t mangle -C FORWARD -o "$tun" -p tcp --tcp-flags SYN,RST SYN \
       -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \
-    || iptables -t mangle -I FORWARD 1 -o "$tun" -p tcp --tcp-flags SYN,RST SYN \
-      -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+    || ipt -t mangle -I FORWARD 1 -o "$tun" -p tcp --tcp-flags SYN,RST SYN \
+      -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \
+    || log "vpn hotspot: tcp mss clamp failed"
 
-  # 5. 回包从 tun 进来、源地址却是公网地址，严格 rp_filter 会当非法包丢掉
-  rpf="/proc/sys/net/ipv4/conf/$tun/rp_filter"
-  if [ -r "$rpf" ]; then
-    VPN_RPF=$(cat "$rpf" 2>/dev/null)
-    [ "$VPN_RPF" = "1" ] && echo 0 > "$rpf" 2>/dev/null
-  fi
+  # 5. 回包从 tun 进来、源地址却是公网地址，严格 rp_filter 会当非法包丢掉。
+  #    内核实际取 max(conf/all/rp_filter, conf/<网卡>/rp_filter)，
+  #    只改 tun 那一份而 all 是 1 时并不生效，两份都要记录 + 清零。
+  VPN_RPF=""
+  VPN_RPF_ALL=""
+  for f in "/proc/sys/net/ipv4/conf/$tun/rp_filter" /proc/sys/net/ipv4/conf/all/rp_filter; do
+    [ -r "$f" ] || continue
+    v=$(cat "$f" 2>/dev/null)
+    case "$f" in
+      */all/*) VPN_RPF_ALL="$v" ;;
+      *)       VPN_RPF="$v" ;;
+    esac
+    [ "$v" = "0" ] || echo 0 > "$f" 2>/dev/null
+  done
 
   # 6. IPv6 旁路：策略路由和 NAT 只覆盖 IPv4，热点客户端的 IPv6 会绕过 VPN
-  #    直接走运营商。默认在热点网卡入口 REJECT，客户端会自己回落到 IPv4。
-  if [ "$VPN_BLOCK_IPV6" = "1" ] && command -v ip6tables > /dev/null 2>&1; then
-    if ip6tables -C FORWARD -i "$hotif" -j REJECT 2>/dev/null \
-      || ip6tables -I FORWARD 1 -i "$hotif" -j REJECT 2>/dev/null; then
+  #    直接走运营商。默认在热点入口 REJECT，客户端会自己回落到 IPv4。
+  if [ "$VPN_BLOCK_IPV6" = "1" ] && [ -n "$IPT6BIN" ] && [ -x "$IPT6BIN" ]; then
+    if ip6t -C FORWARD -i "$hotif" -j REJECT 2>/dev/null \
+      || ip6t -I FORWARD 1 -i "$hotif" -j REJECT 2>/dev/null; then
       VPN_V6BLOCK=1
       log "vpn hotspot: ipv6 from $hotif blocked"
     fi
@@ -339,20 +617,23 @@ disable_vpn_hotspot() {
 }
 
 # 系统的路由/防火墙刷新（切网、VPN 重连、netd 重建链）可能把我们的规则冲掉，定期体检
+# 注意：不能用两条独立的 grep。别的规则里出现 "from $VPN_SUBNET"、另一条无关规则里
+# 出现 "lookup $VPNTB" 时会误判存活，结果规则实际没了却一直不重建。
 vpn_rules_alive() {
-  local rules
-  rules=$(ip rule show 2>/dev/null)
-  echo "$rules" | grep -q "from $VPN_SUBNET" || return 1
-  echo "$rules" | grep -q "lookup $VPNTB" || return 1
+  [ -n "$VPN_SUBNET" ] && [ -n "$VPN_TUN" ] || return 1
+  ip rule show 2>/dev/null | grep -qE "from ${VPN_SUBNET}[^0-9].*lookup ${VPNTB}( |$)" || return 1
   ip route show table "$VPNTB" 2>/dev/null | grep -q '^default' || return 1
-  iptables -t nat -C POSTROUTING -s "$VPN_SUBNET" -o "$VPN_TUN" -j MASQUERADE 2>/dev/null || return 1
-  iptables -C FORWARD -i "$VPN_HOTIF" -o "$VPN_TUN" -j ACCEPT 2>/dev/null || return 1
+  ipt -t nat -C POSTROUTING -s "$VPN_SUBNET" -o "$VPN_TUN" -j MASQUERADE 2>/dev/null || return 1
+  ipt -C FORWARD -s "$VPN_SUBNET" -o "$VPN_TUN" -j ACCEPT 2>/dev/null || return 1
   return 0
 }
 
 adb_on=0
 is_connected=0
 SAVED_BRIGHT=0
+SAVED_SIZE=""
+SAVED_DENSITY=""
+ROUTE_ERR=""
 tick=0
 VPN_FAIL_UNTIL=0
 
@@ -365,7 +646,7 @@ while true; do
   # 4. 根据 Wi-Fi / 热点状态开关无线 ADB
   # 有 scrcpy 连着时不重启 adbd，避免断开会话
   if wifi_up || hotspot_up; then
-    if [ "$adb_on" -eq 0 ]; then
+    if [ "$adb_on" -eq 0 ] && [ "$is_connected" -eq 0 ]; then
       adb_tcp_on
       adb_on=1
     fi
@@ -380,18 +661,30 @@ while true; do
       if [ -n "$BACKLIGHT_NODE" ]; then
         SAVED_BRIGHT=$(cat "$BACKLIGHT_NODE")
       fi
+      # 记下用户原来的 size/density（Override size 形如 "Override size: 1080x2400"）
+      SAVED_SIZE=$(wm size 2>/dev/null | sed -n 's/.*Override size: *//p' | head -n 1)
+      SAVED_DENSITY=$(wm density 2>/dev/null | sed -n 's/.*Override density: *//p' | head -n 1)
       wm size "$TARGET_SIZE"
       wm density "$TARGET_DENSITY"
       is_connected=1
-      log "scrcpy connected, saved brightness=$SAVED_BRIGHT"
+      log "scrcpy connected, saved brightness=$SAVED_BRIGHT size=${SAVED_SIZE:-default} density=${SAVED_DENSITY:-default}"
     fi
-    # 每轮都强制置 0，防止系统/自动亮度把背光改回来
-    if [ -n "$BACKLIGHT_NODE" ] && [ "$(cat "$BACKLIGHT_NODE")" != "0" ]; then
-      echo 0 > "$BACKLIGHT_NODE"
+    # 每轮都强制压低背光，防止系统/自动亮度把它改回来
+    if [ -n "$BACKLIGHT_NODE" ] && [ "$(cat "$BACKLIGHT_NODE" 2>/dev/null)" != "$BRIGHTNESS_OFF" ]; then
+      echo "$BRIGHTNESS_OFF" > "$BACKLIGHT_NODE" 2>/dev/null
     fi
   elif [ "$is_connected" -eq 1 ]; then
-    wm size reset
-    wm density reset
+    # wm size/density reset 回的是出厂值；如果本来就自定义过，恢复成原值
+    if [ -n "$SAVED_SIZE" ]; then
+      wm size "$SAVED_SIZE"
+    else
+      wm size reset
+    fi
+    if [ -n "$SAVED_DENSITY" ]; then
+      wm density "$SAVED_DENSITY"
+    else
+      wm density reset
+    fi
     if [ -n "$BACKLIGHT_NODE" ]; then
       # 保底亮度：原值无效时用最大值的一半，避免黑屏无法操作
       if [ -z "$SAVED_BRIGHT" ] || [ "$SAVED_BRIGHT" -le 0 ] 2>/dev/null; then
