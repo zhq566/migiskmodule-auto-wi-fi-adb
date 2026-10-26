@@ -73,32 +73,55 @@ fi
 # 更糟的是 -C 抢不到锁返回非 0 会被当成「规则不存在」，导致每 20 秒无谓重建。
 IPT_WAIT="-w 2"
 
-# iptables 同理：优先用系统自带的真 xtables，避免命中 BusyBox 的精简 applet
-IPTBIN=""
+# iptables：寻找可用文件，并动态测试其支持的锁参数
 pick_ipt() {
   local cand
+  # 1. 优先找系统自带的
   for cand in /system/bin/iptables /system/xbin/iptables /sbin/iptables; do
-    [ -x "$cand" ] || continue
-    "$cand" $IPT_WAIT -S FORWARD > /dev/null 2>&1 || continue
-    IPTBIN="$cand"
-    return 0
+    if [ -x "$cand" ]; then
+      IPTBIN="$cand"
+      break
+    fi
   done
-  if command -v iptables > /dev/null 2>&1; then
-    IPTBIN=$(command -v iptables)
-    return 0
+  # 2. 回退到环境变量里的
+  [ -z "$IPTBIN" ] && IPTBIN=$(command -v iptables 2>/dev/null)
+  [ -z "$IPTBIN" ] && return 1
+
+  # 3. 动态探测该版本支持哪种等待锁
+  IPT_WAIT=""
+  if "$IPTBIN" -w 2 -L -n >/dev/null 2>&1; then
+    IPT_WAIT="-w 2"
+  elif "$IPTBIN" -w -L -n >/dev/null 2>&1; then
+    IPT_WAIT="-w"
   fi
-  return 1
+  return 0
 }
 pick_ipt || log "no usable iptables"
 
-IPT6BIN=""
-for cand in /system/bin/ip6tables /system/xbin/ip6tables /sbin/ip6tables; do
-  [ -x "$cand" ] && { IPT6BIN="$cand"; break; }
-done
-[ -n "$IPT6BIN" ] || IPT6BIN=$(command -v ip6tables 2>/dev/null)
+# ip6tables 同理
+pick_ip6t() {
+  local cand
+  for cand in /system/bin/ip6tables /system/xbin/ip6tables /sbin/ip6tables; do
+    if [ -x "$cand" ]; then
+      IPT6BIN="$cand"
+      break
+    fi
+  done
+  [ -z "$IPT6BIN" ] && IPT6BIN=$(command -v ip6tables 2>/dev/null)
+
+  IPT6_WAIT=""
+  if [ -n "$IPT6BIN" ]; then
+    if "$IPT6BIN" -w 2 -L -n >/dev/null 2>&1; then
+      IPT6_WAIT="-w 2"
+    elif "$IPT6BIN" -w -L -n >/dev/null 2>&1; then
+      IPT6_WAIT="-w"
+    fi
+  fi
+}
+pick_ip6t
 
 ipt() { "$IPTBIN" $IPT_WAIT "$@"; }
-ip6t() { "$IPT6BIN" $IPT_WAIT "$@"; }
+ip6t() { "$IPT6BIN" $IPT6_WAIT "$@"; }
 
 # 1. 等待系统完全引导启动
 until [ "$(getprop sys.boot_completed)" = "1" ]; do
@@ -138,21 +161,23 @@ uplink_if() {
     | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }'
 }
 
-# netd 开热点时会在 tetherctrl_FORWARD 里写
+# netd 开热点时会在 tetherctrl_FORWARD 里写双向规则
 #   "-A tetherctrl_FORWARD -i <热点网卡> -o <上行> -j RETURN"
 # 用它反查热点网卡比猜名字可靠，而且不依赖 iw（Android 原生镜像根本不带 iw）。
 # 只取 -i 侧：-o 侧是上行网卡（rmnet/tun），把它当热点会直接写坏规则。
+# 必须严格排除蜂窝数据网卡（如 ccmni, rmnet），防止被反向规则误导。
 hotif_from_tether() {
   local cand
+  local uplink=$(uplink_if)
   for cand in $(ipt -S tetherctrl_FORWARD 2>/dev/null \
-      | awk '{
+      | awk -v up="$uplink" '{
           i = ""; o = ""; start = ""
           for (n = 1; n < NF; n++) {
             if ($n == "-i") i = $(n + 1)
             if ($n == "-o") o = $(n + 1)
           }
-          # 只看 FORWARD 转发规则，跳过 netd 的 dns 例外之类的特殊行
-          if (i != "" && i != "lo" && i != o) print i
+          # 跳过 lo、上行网卡、以及典型的蜂窝数据/隧道网卡
+          if (i != "" && i != "lo" && i != o && i != up && i !~ /^(rmnet|ccmni|ppp|pdn|tun|tap|ipsec)/) print i
         }' | sort -u); do
     [ -n "$(ifaddr_of "$cand")" ] && { echo "$cand"; return 0; }
   done
@@ -180,7 +205,7 @@ scan_hotspot() {
 
   # 3) 固定名字的软 AP 网卡
   if [ -z "$HOTIF" ]; then
-    for cand in ap0 softap0 wlan1 swlan0 ap_br_wlan0 br0; do
+    for cand in rndis0 usb0 ncm0 eth0 ap0 softap0 wlan1 swlan0 ap_br_wlan0 br0; do
       [ -n "$(ifaddr_of "$cand")" ] && { HOTIF="$cand"; break; }
     done
   fi
@@ -733,6 +758,7 @@ while true; do
       else
         VPN_FAIL_UNTIL=$(( $(now) + VPN_RETRY ))
         log "vpn hotspot enable failed, retry in ${VPN_RETRY}s"
+        HOTIF=""
       fi
     fi
   else
