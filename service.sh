@@ -43,7 +43,17 @@ chown root:root "$REAL_FRPC_BIN" 2>/dev/null
 LOG="$MODDIR/run.log"
 # 保留上一轮日志（run.log.1），排查「上次为什么没生效」时有用
 [ -f "$LOG" ] && mv -f "$LOG" "$LOG.1"
-log() { echo "$(date '+%m-%d %H:%M:%S') $1" >> "$LOG"; }
+log() {
+  echo "$(date '+%m-%d %H:%M:%S') $1" >> "$LOG_FILE"
+  
+  # 限制 run.log 大小不超过 100KB (102400 字节)
+  local size=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+  if [ "$size" -gt 102400 ]; then
+    # 超限后只保留最后 500 行
+    tail -n 500 "$LOG_FILE" > "$LOG_FILE.tmp"
+    mv -f "$LOG_FILE.tmp" "$LOG_FILE"
+  fi
+}
 now() { date +%s; }
 
 # ===== 选一个支持自定义路由表的 ip =====
@@ -825,7 +835,14 @@ while true; do
     fi
     
   fi
-  # ---------------------------------------
+  # --------------限制 frpc 日志大小 100KB -------------
+  if [ -f "$FRPC_LOG" ]; then
+    frpc_size=$(wc -c < "$FRPC_LOG" 2>/dev/null || echo 0)
+    if [ "$frpc_size" -gt 102400 ]; then
+      tail -n 500 "$FRPC_LOG" > "$FRPC_LOG.tmp"
+      mv -f "$FRPC_LOG.tmp" "$FRPC_LOG"
+    fi
+  fi
 
-  sleep 2
+  sleep 3
 done
