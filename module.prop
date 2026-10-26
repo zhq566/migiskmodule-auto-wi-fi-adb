@@ -1,6 +1,6 @@
 id=cloud_phone_auto
 name=自动助手
-version=1.8
-versionCode=18
+version=1.9
+versionCode=19
 author=Local
 description=连上Wi-Fi或开热点自动开启无线ADB(5555)；scrcpy连入时关背光并切换分辨率，断开后恢复；有TUN的VPN与热点同时存在时自动把热点流量经VPN转发，任一消失自动清理
