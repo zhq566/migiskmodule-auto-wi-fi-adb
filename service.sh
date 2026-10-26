@@ -786,6 +786,16 @@ while true; do
     # VPN 还没就绪（或已断开）时不进入退避，等它一连上就立即生效
     VPN_FAIL_UNTIL=0
   fi
-
+  # 强制固定热点 IP 逻辑 (保持每次连接 IP 均为 192.168.66.1)
+  # 自动寻找带有 wlan 或 ap 名字且活跃的网卡
+  AP_IFACE=$(ip -4 route | grep -E 'wlan|ap' | grep -v default | awk '{print $3}' | head -n 1)
+  
+  if [ -n "$AP_IFACE" ]; then
+    # 检查这个网卡上有没有我们想要的 192.168.66.1
+    if ! ip addr show "$AP_IFACE" 2>/dev/null | grep -q "192.168.66.1"; then
+      ip addr add 192.168.66.1/32 dev "$AP_IFACE" 2>/dev/null
+      log "检测到热点开启，已强行绑定固定 IP: 192.168.66.1 到 $AP_IFACE"
+    fi
+  fi
   sleep 2
 done
